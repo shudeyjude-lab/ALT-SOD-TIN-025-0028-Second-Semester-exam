@@ -1,0 +1,111 @@
+Based on your validation results, your pipeline has correctly identified critical integrity issues. Here is the written assessment required for your Stage 1 Deliverable.
+
+Data Quality Analysis Note
+
+1. Null-Check Findings (Billing, Customers, & Sessions)
+
+ Result: PASS (0 Nulls found).
+ Observations: The source systems are successfully enforcing mandatory fields for primary and foreign keys. Every transaction and session is currently associated with an ID and a customer.
+ Risk to Downstream Aggregations:
+ Minimal: Since no nulls were found, we avoid the risk of "orphaned" records (data that exists but can't be linked to a customer).
+ Context: If nulls had been present, they would have caused inner joins to drop data silently, leading to an underreporting of total revenue and usage in the Gold layer.
+
+2. Duplicate-Check Findings (Billing, Customers, & Sessions)
+
+ Result: FAIL (30k Billing, 1k Customer, and 60k Session duplicates).
+ Observations: There is a massive overlap in unique identifiers. This suggests a "replay" issue in the ingestion process or a lack of primary key enforcement in the staging environment.
+ Risk to Downstream Aggregations:
+ Revenue Inflation: 30,000 duplicate transactions mean your SUM(amount) will be significantly higher than actual bank receipts. This leads to false financial reporting.
+ Network Capacity Skew: 60,000 duplicate sessions will make the network appear twice as busy as it actually is, potentially leading to unnecessary capital expenditure on hardware.
+ Join Fan-out (Explosion): When joining src_billing_transactions to src_customers, the 1,000 duplicate customer IDs will cause a "fan-out" effect. A single transaction could be counted multiple times in the final view because it matches multiple rows for the same customer.
+
+Final Verdict
+Status: REJECTED.
+The data in the Bronze layer is technically "loaded" but logically "corrupt." Moving these records into the Silver layer without a deduplication strategy will result in a Gold layer that provides misleading business insights.
+
+Recommendation: Proceed to Stage 2 with a strict ROW_NUMBER() or DISTINCT logic to prune these duplicates.
+
+
+
+Professional Note: ROW_NUMBER() vs. SELECT DISTINCT
+For the stg_billing table, I chose ROW_NUMBER() over SELECT DISTINCT for two critical reasons:
+
+Granular Control (Priority): SELECT DISTINCT only works if every single column in the row is an exact duplicate. If two rows have the same transaction_id but slightly different transaction_date values (due to a system update or retry), SELECT DISTINCT will keep both rows. ROW_NUMBER() allows us to "partition" by the ID and explicitly choose the most recent record using ORDER BY transaction_date DESC.
+
+Data Integrity: In a professional data warehouse, we often want to keep the "latest" version of a record. ROW_NUMBER() gives us the logic to enforce that business rule, ensuring we only ever have one unique primary key per table, whereas DISTINCT is a "blunt tool" that often leaves subtle duplicates behind if there is even a one-character difference in a timestamp or note field.
+
+The Downstream Benefit NULLIF
+In standard SQL logic, any mathematical operation performed on a NULL value safely evaluates to NULL without throwing an exception.
+
+Using NULLIF allows the data pipeline to execute from end to end without crashing on edge-case profiles. The resulting NULL in the ARPU column clearly informs downstream data consumers (and visualization tools like Power BI or Looker) that the metric is mathematically undefined for that specific customer, rather than providing an inaccurate $0 evaluation.
+
+For Stage 4, we are constructing the final destination of your pipeline: the Data Warehouse Layer. This wide table consolidates your structural customer data, financial metrics, and usage behaviors into a single row per user, perfectly optimized for reporting engines.
+
+---
+
+ 1. The SQL Implementation: dw_user_analytics
+
+To build this table as a robust, production-ready asset, we use LEFT JOIN operations anchored on stg_customers, while wrapping the metrics in COALESCE to ensure zero-safety for downstream BI tools.
+
+sql
+CREATE OR REPLACE TABLE data_tel_gold.dw_user_analytics AS
+SELECT 
+    -- 1. Core Dimensions (Sourced from stg_customers)
+    c.customer_id,
+    c.name AS customer_name,
+    c.email,
+    c.country,
+
+    -- 2. Financial Metrics (Sourced from agg_user_revenue)
+    COALESCE(r.total_revenue, 0) AS total_revenue,
+    COALESCE(r.total_transactions, 0) AS total_transactions,
+
+    -- 3. Network Usage Metrics (Sourced from agg_user_usage)
+    COALESCE(u.total_data_used_mb, 0) AS total_data_used_mb,
+    COALESCE(u.avg_session_duration_sec, 0) AS avg_session_duration_sec,
+    COALESCE(u.total_sessions, 0) AS total_sessions,
+
+    -- 4. Normalized Financials (Sourced from agg_arpu)
+    COALESCE(a.arpu, 0) AS arpu,
+
+    -- 5. Behavioral Distribution (Sourced from agg_session_distribution)
+    COALESCE(s.short_sessions, 0) AS short_sessions,
+    COALESCE(s.medium_sessions, 0) AS medium_sessions,
+    COALESCE(s.long_sessions, 0) AS long_sessions,
+
+    -- 6. Derived Metric (Calculated inline with divide-by-zero protection)
+    COALESCE(u.total_data_used_mb, 0) / NULLIF(COALESCE(u.total_sessions, 0), 0) AS avg_data_per_session_mb
+
+FROM data_tel_silver.stg_customers c
+LEFT JOIN data_tel_gold.agg_user_revenue r 
+    ON c.customer_id = r.customer_id
+LEFT JOIN data_tel_gold.agg_user_usage u 
+    ON c.customer_id = u.customer_id
+LEFT JOIN data_tel_gold.agg_arpu a 
+    ON c.customer_id = a.customer_id
+LEFT JOIN data_tel_gold.agg_session_distribution s 
+    ON c.customer_id = s.customer_id;
+
+
+
+---
+
+ 2. Written Justification of the Join Strategy
+
+Why LEFT JOIN is Mandatory
+
+In a data warehouse architecture, the dimensions table (stg_customers) acts as the absolute anchor table (the left side of the operation). A LEFT JOIN guarantees that every single customer record present in the staging layer is preserved in the final output, regardless of whether they have generated operational activity.
+
+What Breaks if You Use INNER JOIN?
+
+If you substitute LEFT JOIN with INNER JOIN, the SQL engine will strictly return rows where a customer_id exists in all joined tables simultaneously. This would break your data warehouse in two critical ways:
+
+1. Silent Customer Deletion (The Dark Data Problem): A newly registered user who has not yet completed a transaction or initiated a network session will not have records in the aggregation tables. An INNER JOIN would silently drop this customer from the final output. Your executive dashboards would show a lower total customer count than what actually exists in your database.
+2. Severe Metric Skewing: If an active customer makes phone calls (agg_user_usage) but never purchases a digital subscription (agg_user_revenue), an INNER JOIN drops them entirely. You lose their usage data simply because they didn’t generate revenue, breaking your network capacity planning models.
+
+The Role of COALESCE and NULLIF
+
+When utilizing a LEFT JOIN, any customer without operational history naturally returns a NULL from the right-hand tables.
+
+ COALESCE(column, 0) intercepts these blanks, transforming them into a safe numerical 0. Without this step, downstream BI analysts building reports (e.g., calculating total network load or group averages) would run into calculation errors, as adding a number to NULL in SQL yields NULL.
+ NULLIF(..., 0) protects the derived avg_data_per_session_mb metric. For a user with zero sessions, it converts the denominator to NULL, rendering the final calculation a safe NULL (which COALESCE handles or leaves clean) instead of triggering a catastrophic system-wide crash.
